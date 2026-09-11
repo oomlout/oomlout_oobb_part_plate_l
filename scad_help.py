@@ -1,11 +1,159 @@
 import copy
-import opsc
 import oobb
-import oobb_base
 import yaml
 import os
-import scad
+import re
+import working_scad
 ###### utilities
+
+
+def cleanup_raw_scad_artifacts(folder):
+    if not folder or not os.path.isdir(folder):
+        return
+
+    hex_pattern = re.compile(r"^(?P<stem>.+)_[0-9a-f]{16}\.scad$")
+    referenced_helpers = {}
+
+    for entry in os.listdir(folder):
+        if not entry.endswith(".scad"):
+            continue
+
+        scad_path = os.path.join(folder, entry)
+        try:
+            with open(scad_path, "r", encoding="utf-8") as handle:
+                contents = handle.read()
+        except OSError:
+            continue
+
+        for match in re.finditer(r"use <([^>]+/(?P<stem_abs>[^/>]+)_[0-9a-f]{16}\.scad|(?P<stem_rel>[^/>]+)_[0-9a-f]{16}\.scad)>", contents):
+            stem = match.group("stem_abs") or match.group("stem_rel")
+            hashed_name = os.path.basename(match.group(1))
+            referenced_helpers[stem] = hashed_name
+
+        updated = re.sub(
+            r"use <([^>]+/)?(?P<stem>[^/>]+)_[0-9a-f]{16}\.scad>",
+            lambda m: f"use <{m.group('stem')}.scad>",
+            contents,
+        )
+        if updated != contents:
+            with open(scad_path, "w", encoding="utf-8") as handle:
+                handle.write(updated)
+
+    for stem, hashed_name in referenced_helpers.items():
+        friendly_path = os.path.join(folder, f"{stem}.scad")
+        hashed_path = os.path.join(folder, hashed_name)
+        if not os.path.exists(friendly_path) and os.path.exists(hashed_path):
+            with open(hashed_path, "r", encoding="utf-8") as src:
+                contents = src.read()
+            with open(friendly_path, "w", encoding="utf-8") as dst:
+                dst.write(contents)
+
+    for entry in os.listdir(folder):
+        match = hex_pattern.match(entry)
+        if not match:
+            continue
+
+        friendly_name = f"{match.group('stem')}.scad"
+        friendly_path = os.path.join(folder, friendly_name)
+        hashed_path = os.path.join(folder, entry)
+
+        if os.path.exists(friendly_path):
+            try:
+                os.remove(hashed_path)
+            except OSError:
+                pass
+
+def get_typ(**kwargs):
+    typ = kwargs.get("typ", "")
+
+    if typ == "":
+        #setup
+        #typ = "all"
+        typ = "fast"
+        #typ = "manual"
+
+    return typ
+
+
+def get_build_variables(typ, filter=""):
+    if typ == "all":
+        return {
+            "filter": "",
+            "save_type": "all",
+            "navigation": True,
+            "overwrite": True,
+            "modes": ["3dpr"],
+            "oomp_run": True,
+        }
+
+    if typ == "fast":
+        return {
+            "filter": "",
+            "save_type": "none",
+            "navigation": True,
+            "overwrite": True,
+            "modes": ["3dpr"],
+            "oomp_run": False,
+        }
+
+    if typ == "manual":
+        return {
+            "filter": "",
+            #"filter": "test"
+            "save_type": "none",
+            #"save_type": "all"
+            "navigation": True,
+            #"navigation": False
+            "overwrite": True,
+            "modes": ["3dpr"],
+            #"modes": ["3dpr", "laser", "true"]
+            #"modes": ["laser"]
+            "oomp_run": True,
+            #"oomp_run": False
+        }
+
+    raise ValueError(f"Unknown typ: {typ}")
+
+
+def get_navigation_sort(oobb_style=False):
+    sort = []
+    if oobb_style:
+        #sort.append("extra")
+        sort.append("oobb_name") 
+        sort.append("width")
+        sort.append("height")
+        sort.append("thickness")
+    else:
+        for i in range(1, 10):
+            sort.append(f"taxonomy_{i}")
+    return sort
+
+
+def prepare_base_for_print(thing, pos, **kwargs):
+    #put into a rotation object
+    components_second = copy.deepcopy(thing["components"])
+    return_value_2 = {}
+    return_value_2["type"]  = "rotation"
+    return_value_2["typetype"]  = "p"
+    pos1 = copy.deepcopy(pos)
+    pos1[0] += 50
+    return_value_2["pos"] = pos1
+    return_value_2["rot"] = [180,0,0]
+    return_value_2["objects"] = components_second
+
+    thing["components"].append(return_value_2)
+
+    #add slice # top
+    p3 = copy.deepcopy(kwargs)
+    p3["type"] = "n"
+    p3["shape"] = f"oobb_slice"
+    pos1 = copy.deepcopy(pos)
+    pos1[0] += -500/2
+    pos1[1] += 0
+    pos1[2] += -500/2
+    p3["pos"] = pos1
+    #p3["m"] = "#"
+    oobb.append_full(thing,**p3)
 
 def make_parts(**kwargs):
     parts = kwargs.get("parts", [])
@@ -13,25 +161,20 @@ def make_parts(**kwargs):
     #make the parts
     if True:
         for part in parts:
-            name = part.get("name", "default")            
+            oobb_name = part.get("oobb_name", "default")            
             extra = part["kwargs"].get("extra", "")
-            if filter in name or filter in extra:
-                print(f"making {part['name']}")
+            if filter in oobb_name or filter in extra:
+                print(f"making {part['oobb_name']}")
                 make_scad_generic(part)            
                 
             else:
-                print(f"skipping {part['name']}")
-
-    #run oomp
-    oomp_run = kwargs.get("oomp_run", False)
-    if kwargs.get("oomp_run", False):
-        import action_build_oomp
-        action_build_oomp.main()
+                print(f"skipping {part['oobb_name']}")
+    
 
 def make_scad_generic(part):
     
     # fetching variables
-    name = part.get("name", "default")
+    oobb_name = part.get("oobb_name", "default")
     project_name = part.get("project_name", "default")
     
     kwargs = part.get("kwargs", {})    
@@ -40,21 +183,22 @@ def make_scad_generic(part):
     save_type = kwargs.get("save_type", "all")
     overwrite = kwargs.get("overwrite", True)
 
-    kwargs["type"] = f"{project_name}_{name}"
+    kwargs["type"] = f"{project_name}_{oobb_name}"
 
-    thing = oobb_base.get_default_thing(**kwargs)
+    thing = oobb.get_default_thing(**kwargs)
+    thing.update(part)
     kwargs.pop("size","")
 
-    #get the part from the function get_{name}"
+    #get the part from the function get_{oobb_name}"
     try:
-        func = getattr(scad, f"get_{name}")
+        func = getattr(working_scad, f"get_{oobb_name}")
     except AttributeError:
         func = None
     # test if func exists
     if callable(func):            
         func(thing, **kwargs)        
     else:            
-        scad.get_base(thing, **kwargs)   
+        working_scad.get_base(thing, **kwargs)   
 
     oomp_mode = kwargs.get("oomp_mode", "project")
     
@@ -78,33 +222,24 @@ def make_scad_generic(part):
             descextra = f"{descextra}_extra"
         kwargs["oomp_description_main"] = f"{current_description_main}"
         kwargs["oomp_description_extra"] = f"{descextra}"
-        kwargs["oomp_size"] = f"{part["name"]}"
-
-    #move oomp bits from kwargs to part
-    oomp_keys = ["classification", "type", "size", "color", "description_main", "description_extra", "manufacturer", "part_number"]
-    for key in ["classification", "type", "size", "color", "description_main", "description_extra", "manufacturer", "part_number"]:
-        part[key] = kwargs.get(f"oomp_{key}", f"")
-
-
-
+        kwargs["oomp_size"] = f"{part['oobb_name']}"
 
     #id = thing.get("oobb_id", "default")    
     
 
     #kwargs["description_main"] = id
 
-    oomp_id = ""
-    for key in oomp_keys:
-        deet = part.get(key, "")
-        deet = deet.replace(".","_")
-        if deet != "":
-            oomp_id += f"{deet}_"
-    oomp_id = oomp_id[:-1]
+    oomp_keys = ["classification", "type", "size", "color", "description_main", "description_extra", "manufacturer", "part_number"]
+    oomp_id = part.get("id", "")
+    if oomp_id == "":
+        for key in oomp_keys:
+            deet = part.get(key, "")
+            deet = deet.replace(".","_")
+            if deet != "":
+                oomp_id += f"{deet}_"
+        oomp_id = oomp_id[:-1]
     part["id"] = oomp_id
     folder = f"parts/{oomp_id}"
-    folder_scad_ouput = f"scad_output/{descmain}"
-    if descextra != "":
-        folder_scad_ouput += f"_{descextra}"
 
     for mode in modes:
         depth = thing.get(
@@ -119,19 +254,8 @@ def make_scad_generic(part):
             start = 0.5
         
 
-        opsc.opsc_make_object(f'{folder}/{mode}.scad', thing["components"], mode=mode, save_type=save_type, overwrite=overwrite, layers=layers, tilediff=tilediff, start=start)  
-
-        #copy folder to scad_output_folder
-        if True:
-            print(f"copying {folder} to {folder_scad_ouput}")
-            import os
-            if not os.path.exists(folder_scad_ouput):
-                os.makedirs(folder_scad_ouput)
-            if os.name == 'nt':
-                #copy a full directory auto overwrite
-                command = f'xcopy "{folder}" "{folder_scad_ouput}" /E /I /Y'
-                            #print(command)
-                os.system(command)
+        oobb.opsc_make_object(f'{folder}/{mode}.scad', thing["components"], mode=mode, save_type=save_type, overwrite=overwrite, layers=layers, tilediff=tilediff, start=start)
+        cleanup_raw_scad_artifacts(folder)
         
 
 
@@ -170,7 +294,6 @@ def make_scad_generic(part):
 def generate_navigation(folder="parts", sort=["width", "height", "thickness"]):
     #crawl though all directories in scad_output and load all the working.yaml files
     parts = {}
-    print("Loading parts from {folder}...", end='', flush=True)
     for root, dirs, files in os.walk(folder):
         if 'working.yaml' in files:
             yaml_file = os.path.join(root, 'working.yaml')
@@ -186,8 +309,7 @@ def generate_navigation(folder="parts", sort=["width", "height", "thickness"]):
                     part_name = part_name.replace("/","").replace("\\","")
                     parts[part_name] = part
 
-                    #print(f"Loaded {yaml_file}")
-                    print(f".", end='', flush=True)
+                    print(f"Loaded {yaml_file}")
 
     pass
     
@@ -201,10 +323,12 @@ def generate_navigation(folder="parts", sort=["width", "height", "thickness"]):
                 folder_source = part["folder"]
                 folder_extra = ""
                 for s in sort:
-                    if s == "name":
-                        ex = part.get("name", "default")
+                    if s == "oobb_name":
+                        ex = part.get("oobb_name", "default")
                     else:                        
                         ex = kwarg_copy.get(s, "default")
+                        if ex == "default":
+                            ex = part.get(s, "default")
                         #if ex is a list
                         if isinstance(ex, list):
                             ex_string = ""
@@ -212,11 +336,15 @@ def generate_navigation(folder="parts", sort=["width", "height", "thickness"]):
                                 ex_string += f"{e}_"
                             ex = ex_string[:-1]
                             ex = ex.replace(".","d")                            
-                    folder_extra += f"{s}_{ex}/"
+                    if ex != "default" and ex != "":
+                        if "taxonomy_" in s:
+                            folder_extra += f"{ex}/"
+                        else:
+                            folder_extra += f"{s}_{ex}/"
 
                 #replace "." with d
                 folder_extra = folder_extra.replace(".","d")            
-                folder_destination = f"{folder_navigation}/{folder_extra}".lower()
+                folder_destination = f"{folder_navigation}/{folder_extra}"
                 if not os.path.exists(folder_destination):
                     os.makedirs(folder_destination)
                 if os.name == 'nt':
@@ -226,4 +354,5 @@ def generate_navigation(folder="parts", sort=["width", "height", "thickness"]):
                     os.system(command)
                 else:
                     os.system(f"cp {folder_source} {folder_destination}")
+                cleanup_raw_scad_artifacts(folder_destination)
 
